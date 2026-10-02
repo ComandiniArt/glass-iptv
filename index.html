@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glasses IPTV</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<style>
+  :root { --bg:#000; --fg:#fff; --dim:#9aa0a6; --accent:#4cc3ff; --row:#111; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; }
+  [hidden] { display:none !important; }
+
+  /* ---------- LIST SCREEN ---------- */
+  #listScreen { height:100%; display:flex; flex-direction:column; padding:12px; gap:10px; }
+  #topbar { display:flex; gap:8px; flex-wrap:wrap; }
+  button, input[type=text] {
+    font:inherit; color:var(--fg); background:var(--row); border:2px solid #333;
+    border-radius:12px; padding:12px 16px; font-size:20px; min-height:52px;
+  }
+  input[type=text] { flex:1; min-width:140px; }
+  button:focus, input:focus { outline:none; border-color:var(--accent); background:#0b2a3a; }
+  #status { color:var(--dim); font-size:16px; }
+  #list { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:6px; padding-bottom:40px; }
+  .ch { display:flex; align-items:center; gap:12px; text-align:left; width:100%; }
+  .ch img { width:40px; height:40px; object-fit:contain; border-radius:6px; background:#222; flex:none; }
+  .ch .ph { width:40px; height:40px; flex:none; border-radius:6px; background:#222; }
+  .ch .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ch .grp { color:var(--dim); font-size:14px; }
+  .ch .fav { color:#ffd54a; }
+
+  #empty { text-align:center; margin:auto; max-width:480px; }
+  #empty h2 { font-size:28px; margin:0 0 8px; }
+  #empty p { color:var(--dim); font-size:18px; }
+  textarea { width:100%; height:90px; background:var(--row); color:var(--fg); border:2px solid #333;
+    border-radius:12px; padding:10px; font-size:14px; }
+
+  /* ---------- PLAYER SCREEN ---------- */
+  #playerScreen { position:fixed; inset:0; background:#000; }
+  video { width:100%; height:100%; object-fit:contain; background:#000; }
+  #overlay { position:absolute; left:0; right:0; bottom:0; padding:16px 20px calc(16px + env(safe-area-inset-bottom,0px));
+    background:linear-gradient(transparent, rgba(0,0,0,.85)); transition:opacity .25s; }
+  #overlay.hide { opacity:0; pointer-events:none; }
+  #nowName { font-size:28px; font-weight:600; }
+  #nowSub { color:var(--dim); font-size:16px; margin-top:2px; }
+  #msg { position:absolute; top:50%; left:0; right:0; text-align:center; font-size:22px; padding:0 24px; transform:translateY(-50%); }
+  #ctrls { display:flex; gap:8px; margin-top:10px; }
+  #ctrls button { flex:1; }
+</style>
+</head>
+<body>
+
+<!-- LIST SCREEN -->
+<div id="listScreen">
+  <div id="topbar">
+    <input type="text" id="search" placeholder="Search channels" autocomplete="off">
+    <button id="groupBtn">All groups</button>
+    <button id="favBtn">★ Favs</button>
+    <button id="loadBtn">Load M3U</button>
+  </div>
+  <div id="status"></div>
+  <div id="list"></div>
+
+  <div id="empty" hidden>
+    <h2>Load your playlist</h2>
+    <p>Pick an .m3u / .m3u8 file, or paste the playlist text or a URL below.</p>
+    <button id="pickBtn" style="width:100%">Choose M3U file</button>
+    <p style="margin:14px 0 6px">Or paste text / URL:</p>
+    <textarea id="paste" placeholder="#EXTM3U ... or https://.../playlist.m3u"></textarea>
+    <button id="pasteBtn" style="width:100%;margin-top:8px">Load pasted</button>
+  </div>
+</div>
+<input type="file" id="file" accept=".m3u,.m3u8,.txt,audio/x-mpegurl,application/vnd.apple.mpegurl" hidden>
+
+<!-- PLAYER SCREEN -->
+<div id="playerScreen" hidden>
+  <video id="video" playsinline autoplay></video>
+  <div id="msg" hidden></div>
+  <div id="overlay">
+    <div id="nowName"></div>
+    <div id="nowSub"></div>
+    <div id="ctrls">
+      <button id="prevBtn">▲ Prev</button>
+      <button id="favToggle">★</button>
+      <button id="backBtn">☰ List</button>
+      <button id="nextBtn">▼ Next</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video');
+  const KEY_PL = 'giptv.playlist', KEY_FAV = 'giptv.favs', KEY_LAST = 'giptv.last';
+
+  let channels = [];       // all parsed channels
+  let filtered = [];       // current list view
+  let groups = ['All groups'];
+  let groupIdx = 0;
+  let favsOnly = false;
+  let favs = new Set();
+  let current = -1;        // index into `filtered` while playing
+  let hls = null;
+  let hideTimer = null;
+  let shown = 0;
+  const PAGE = 150;
+
+  // ---------- storage helpers ----------
+  const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+  const load = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+
+  // ---------- M3U parsing ----------
+  function parseM3U(text) {
+    const out = [];
+    const lines = text.split(/\r?\n/);
+    let meta = null;
+    for (let raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith('#EXTINF')) {
+        meta = { name: '', logo: '', group: '' };
+        const attrs = {};
+        line.replace(/([\w-]+)="([^"]*)"/g, (_, k, v) => { attrs[k.toLowerCase()] = v; return ''; });
+        const comma = line.lastIndexOf(',');
+        meta.name = (comma >= 0 ? line.slice(comma + 1).trim() : '') || attrs['tvg-name'] || 'Channel';
+        meta.logo = attrs['tvg-logo'] || '';
+        meta.group = attrs['group-title'] || '';
+      } else if (line.startsWith('#EXTGRP:')) {
+        if (meta && !meta.group) meta.group = line.slice(8).trim();
+      } else if (line.startsWith('#')) {
+        continue;
+      } else {
+        out.push({ name: meta ? meta.name : line, logo: meta ? meta.logo : '',
+                   group: (meta && meta.group) || 'Other', url: line });
+        meta = null;
+      }
+    }
+    return out;
+  }
+
+  function setPlaylist(text, persist = true) {
+    const parsed = parseM3U(text);
+    if (!parsed.length) { $('status').textContent = 'No channels found in that playlist.'; return false; }
+    channels = parsed;
+    const g = [...new Set(channels.map(c => c.group))].sort((a, b) => a.localeCompare(b));
+    groups = ['All groups', ...g];
+    groupIdx = 0;
+    if (persist) save(KEY_PL, text);
+    applyFilter();
+    return true;
+  }
+
+  // ---------- list rendering ----------
+  function applyFilter() {
+    const q = $('search').value.trim().toLowerCase();
+    const g = groups[groupIdx];
+    filtered = channels.filter(c =>
+      (groupIdx === 0 || c.group === g) &&
+      (!favsOnly || favs.has(c.url)) &&
+      (!q || c.name.toLowerCase().includes(q)));
+    $('groupBtn').textContent = g.length > 18 ? g.slice(0, 17) + '…' : g;
+    $('favBtn').style.borderColor = favsOnly ? '#ffd54a' : '';
+    $('status').textContent = `${filtered.length} of ${channels.length} channels`;
+    $('empty').hidden = channels.length > 0;
+    $('list').hidden = channels.length === 0;
+    shown = 0;
+    $('list').innerHTML = '';
+    renderMore();
+  }
+
+  function renderMore() {
+    const list = $('list');
+    const old = $('moreBtn'); if (old) old.remove();
+    const end = Math.min(filtered.length, shown + PAGE);
+    const frag = document.createDocumentFragment();
+    for (let i = shown; i < end; i++) {
+      const c = filtered[i];
+      const b = document.createElement('button');
+      b.className = 'ch nav';
+      if (c.logo) {
+        const im = document.createElement('img');
+        im.loading = 'lazy'; im.src = c.logo; im.alt = '';
+        im.onerror = () => { const p = document.createElement('div'); p.className = 'ph'; im.replaceWith(p); };
+        b.appendChild(im);
+      } else { const p = document.createElement('div'); p.className = 'ph'; b.appendChild(p); }
+      const n = document.createElement('div'); n.className = 'name'; n.textContent = c.name;
+      const gr = document.createElement('div'); gr.className = 'grp'; gr.textContent = c.group;
+      b.append(n, gr);
+      if (favs.has(c.url)) { const s = document.createElement('span'); s.className = 'fav'; s.textContent = '★'; b.appendChild(s); }
+      b.addEventListener('click', () => play(i));
+      frag.appendChild(b);
+    }
+    shown = end;
+    list.appendChild(frag);
+    if (shown < filtered.length) {
+      const m = document.createElement('button');
+      m.id = 'moreBtn'; m.className = 'nav'; m.textContent = `Show more (${filtered.length - shown} left)`;
+      m.onclick = () => { renderMore(); };
+      list.appendChild(m);
+    }
+  }
+
+  // ---------- playback ----------
+  function stop() {
+    if (hls) { hls.destroy(); hls = null; }
+    video.pause(); video.removeAttribute('src'); video.load();
+  }
+
+  function showMsg(t) { const m = $('msg'); m.textContent = t || ''; m.hidden = !t; }
+
+  function play(i) {
+    if (!filtered.length) return;
+    current = (i + filtered.length) % filtered.length;
+    const c = filtered[current];
+    $('listScreen').hidden = true;
+    $('playerScreen').hidden = false;
+    $('nowName').textContent = c.name;
+    $('nowSub').textContent = `${c.group}  ·  ${current + 1}/${filtered.length}`;
+    $('favToggle').textContent = favs.has(c.url) ? '★ Saved' : '☆ Save';
+    showMsg('Loading…');
+    showOverlay();
+    save(KEY_LAST, c.url);
+    stop();
+
+    const isHls = /\.m3u8(\?|$)/i.test(c.url) || /\/hls\//i.test(c.url);
+    if (isHls && window.Hls && Hls.isSupported()) {
+      hls = new Hls({ lowLatencyMode: true });
+      hls.loadSource(c.url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (d.fatal) {
+          if (d.type === Hls.ErrorTypes.NETWORK_ERROR) { showMsg('Network error – retrying…'); hls.startLoad(); }
+          else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); }
+          else showMsg('Stream failed. Try another channel.');
+        }
+      });
+    } else {
+      video.src = c.url; // native HLS (Safari) or direct mp4/webm streams
+      video.play().catch(() => {});
+    }
+  }
+
+  video.addEventListener('playing', () => showMsg(''));
+  video.addEventListener('waiting', () => showMsg('Buffering…'));
+  video.addEventListener('error', () => showMsg('Cannot play this stream (format or CORS).'));
+
+  function back() {
+    stop();
+    $('playerScreen').hidden = true;
+    $('listScreen').hidden = false;
+    const el = document.querySelectorAll('#list .ch')[current];
+    (el || $('search')).focus?.();
+    if (el) el.scrollIntoView({ block: 'center' });
+  }
+
+  function showOverlay() {
+    const o = $('overlay');
+    o.classList.remove('hide');
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => o.classList.add('hide'), 4000);
+  }
+
+  // ---------- events ----------
+  $('loadBtn').onclick = () => $('file').click();
+  $('pickBtn').onclick = () => $('file').click();
+  $('file').addEventListener('change', async e => {
+    const f = e.target.files[0]; if (!f) return;
+    setPlaylist(await f.text());
+    e.target.value = '';
+  });
+  $('pasteBtn').onclick = async () => {
+    const v = $('paste').value.trim(); if (!v) return;
+    if (/^https?:\/\//i.test(v) && !v.includes('\n')) {
+      $('status').textContent = 'Fetching…';
+      try { const r = await fetch(v); setPlaylist(await r.text()); }
+      catch (e) { $('status').textContent = 'Could not fetch URL (blocked by CORS?). Download the file and upload it instead.'; $('empty').hidden = false; }
+    } else setPlaylist(v);
+  };
+  let t;
+  $('search').addEventListener('input', () => { clearTimeout(t); t = setTimeout(applyFilter, 200); });
+  $('groupBtn').onclick = () => { groupIdx = (groupIdx + 1) % groups.length; applyFilter(); };
+  $('favBtn').onclick = () => { favsOnly = !favsOnly; applyFilter(); };
+
+  $('prevBtn').onclick = () => { play(current - 1); };
+  $('nextBtn').onclick = () => { play(current + 1); };
+  $('backBtn').onclick = back;
+  $('favToggle').onclick = () => {
+    const c = filtered[current];
+    favs.has(c.url) ? favs.delete(c.url) : favs.add(c.url);
+    save(KEY_FAV, JSON.stringify([...favs]));
+    $('favToggle').textContent = favs.has(c.url) ? '★ Saved' : '☆ Save';
+    showOverlay();
+  };
+
+  // tap video toggles overlay; vertical swipe changes channel
+  let sy = null;
+  const ps = $('playerScreen');
+  ps.addEventListener('touchstart', e => { sy = e.touches[0].clientY; }, { passive: true });
+  ps.addEventListener('touchend', e => {
+    if (sy === null) return;
+    const dy = e.changedTouches[0].clientY - sy; sy = null;
+    if (Math.abs(dy) > 60) play(current + (dy < 0 ? 1 : -1));
+  });
+  video.addEventListener('click', () => {
+    $('overlay').classList.contains('hide') ? showOverlay() : $('overlay').classList.add('hide');
+  });
+
+  // keyboard / d-pad style navigation (arrows + Enter + Back/Escape)
+  document.addEventListener('keydown', e => {
+    const inPlayer = !$('playerScreen').hidden;
+    if (inPlayer) {
+      if (e.key === 'ArrowUp' || e.key === 'ChannelUp' || e.key === 'PageUp') { e.preventDefault(); play(current - 1); }
+      else if (e.key === 'ArrowDown' || e.key === 'ChannelDown' || e.key === 'PageDown') { e.preventDefault(); play(current + 1); }
+      else if (e.key === 'Escape' || e.key === 'Backspace' || e.key === 'GoBack') { e.preventDefault(); back(); }
+      else if (e.key === 'Enter' || e.key === ' ') {
+        if (document.activeElement.tagName !== 'BUTTON') { e.preventDefault(); showOverlay(); }
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        const bs = [...document.querySelectorAll('#ctrls button')];
+        const i = bs.indexOf(document.activeElement);
+        bs[(i + (e.key === 'ArrowRight' ? 1 : -1) + bs.length) % bs.length].focus();
+        showOverlay();
+      }
+      return;
+    }
+    const typing = document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA';
+    if (typing && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return;
+    if (['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+      const els = [...document.querySelectorAll('#topbar > *, #list .nav, #empty button, #empty textarea')]
+        .filter(el => el.offsetParent !== null);
+      let i = els.indexOf(document.activeElement);
+      const dir = (e.key === 'ArrowDown' || e.key === 'ArrowRight') ? 1 : -1;
+      i = i < 0 ? 0 : Math.min(els.length - 1, Math.max(0, i + dir));
+      els[i].focus(); els[i].scrollIntoView({ block: 'nearest' });
+      e.preventDefault();
+    }
+  });
+
+  // ---------- init ----------
+  try { favs = new Set(JSON.parse(load(KEY_FAV) || '[]')); } catch (e) {}
+  const saved = load(KEY_PL);
+  if (saved) setPlaylist(saved, false); else applyFilter();
+})();
+</script>
+</body>
+</html>
